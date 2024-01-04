@@ -99,23 +99,23 @@ type RecvdVal struct {
 }
 
 // GetValue searches for the value corresponding to given Key.
-func (dht *IpfsDHT) GetValueHops(ctx context.Context, key string, opts ...routing.Option) (_ []byte, hops int, err error) {
+func (dht *IpfsDHT) GetValueHops(ctx context.Context, key string, opts ...routing.Option) (_ []byte, hops int, getLatency time.Duration, getTimestamp time.Time, err error) {
 
 	if !dht.enableValues {
-		return nil, 0, routing.ErrNotSupported
+		return nil, 0, 0, time.Time{}, routing.ErrNotSupported
 	}
 
 	// apply defaultQuorum if relevant
 	var cfg routing.Options
 	if err := cfg.Apply(opts...); err != nil {
-		return nil, 0, err
+		return nil, 0, 0, time.Time{}, err
 	}
 	opts = append(opts, Quorum(getQuorum(&cfg, defaultQuorum)))
 
-	responses, hops, err := dht.SearchValueHops(ctx, key, opts...)
+	responses, hops, getLatency, getTimestamp, err := dht.SearchValueHops(ctx, key, opts...)
 
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, time.Time{}, err
 	}
 	var best []byte
 
@@ -124,14 +124,14 @@ func (dht *IpfsDHT) GetValueHops(ctx context.Context, key string, opts ...routin
 	}
 
 	if ctx.Err() != nil {
-		return best, hops, ctx.Err()
+		return best, hops, getLatency, getTimestamp, ctx.Err()
 	}
 
 	if best == nil {
-		return nil, 0, routing.ErrNotFound
+		return nil, 0, 0, time.Time{}, routing.ErrNotFound
 	}
 	logger.Debugf("GetValue %v %x", loggableRecordKeyString(key), best)
-	return best, hops, nil
+	return best, hops, getLatency, getTimestamp, nil
 }
 
 // GetValue searches for the value corresponding to given Key.
@@ -171,14 +171,14 @@ func (dht *IpfsDHT) GetValue(ctx context.Context, key string, opts ...routing.Op
 }
 
 // SearchValue searches for the value corresponding to given Key and streams the results.
-func (dht *IpfsDHT) SearchValueHops(ctx context.Context, key string, opts ...routing.Option) (<-chan []byte, int, error) {
+func (dht *IpfsDHT) SearchValueHops(ctx context.Context, key string, opts ...routing.Option) (<-chan []byte, int, time.Duration, time.Time, error) {
 	if !dht.enableValues {
-		return nil, 0, routing.ErrNotSupported
+		return nil, 0, 0, time.Time{}, routing.ErrNotSupported
 	}
 
 	var cfg routing.Options
 	if err := cfg.Apply(opts...); err != nil {
-		return nil, 0, err
+		return nil, 0, 0, time.Time{}, err
 	}
 
 	responsesNeeded := 0
@@ -190,18 +190,21 @@ func (dht *IpfsDHT) SearchValueHops(ctx context.Context, key string, opts ...rou
 	valCh, lookupRes, hops := dht.getValuesHops(ctx, key, stopCh)
 
 	out := make(chan []byte)
-	go func() {
+	startTime := time.Now()
+	var getLatency time.Duration
+	var getTimestamp time.Time
+	go func(startTime time.Time) (time.Duration, time.Time) {
 		defer close(out)
 		best, peersWithBest, aborted := dht.searchValueQuorum(ctx, key, valCh, stopCh, out, responsesNeeded)
 		if best == nil || aborted {
-			return
+			return 0, time.Time{}
 		}
 
 		updatePeers := make([]peer.ID, 0, dht.bucketSize)
 		select {
 		case l := <-lookupRes:
 			if l == nil {
-				return
+				return 0, time.Time{}
 			}
 
 			for _, p := range l.peers {
@@ -210,13 +213,18 @@ func (dht *IpfsDHT) SearchValueHops(ctx context.Context, key string, opts ...rou
 				}
 			}
 		case <-ctx.Done():
-			return
+			return 0, time.Time{}
 		}
 
 		dht.updatePeerValues(dht.Context(), key, best, updatePeers)
-	}()
 
-	return out, hops, nil
+		return getLatency, getTimestamp
+	}(startTime)
+
+	getLatency = time.Since(startTime)
+	getTimestamp = time.Now()
+
+	return out, hops, getLatency, getTimestamp, nil
 }
 
 // SearchValue searches for the value corresponding to given Key and streams the results.
